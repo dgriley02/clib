@@ -1,8 +1,6 @@
+#ifndef CLIB_BASE
+#define CLIB_BASE
 #include <stdint.h>
-#include <string.h>
-#include <stdarg.h>
-#include <stdio.h>
-
 typedef int8_t  i8;
 typedef int16_t i16;
 typedef int32_t i32;
@@ -21,7 +19,6 @@ typedef int64_t b64;
 typedef float f32;
 typedef double f64;
 
-
 #define true  1
 #define false 0
 
@@ -37,91 +34,39 @@ typedef double f64;
 #define FlagClear(_enum, i) ((_enum) &= ~(i))
 #define FlagToggle(_enum, i) ((_enum) ^= (i))
 
-#if defined(__linux)
+#define ARR_CONST_LENGTH(A) (sizeof(A) / sizeof(*A))
 
-#include <sys/mman.h>
+#define ALIGN_OF(T) (sizeof(struct { u8 a; T b;}))
 
-#define ALIGN_OF(X) (__alignof__(X))
+// -------------- Arena ------------
 
-#define PAGE_SIZE KiloBytes(4)
-
-static void* __VMReserve(size_t size) {
-    void* p = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return p == MAP_FAILED ? NULL : p;
-}
-static b32 __VMCommit(void* p, size_t size) {
-    return mprotect(p, size, PROT_READ | PROT_WRITE) == 0;
-}
-static void __VMDecommit(void* p, size_t size) {
-    madvise(p, size, MADV_DONTNEED);
-    mprotect(p, size, PROT_NONE);
-}
-static void __VMDereserve(void* p, size_t size) {
-    munmap(p, size);
-}
-
-#endif
-
-static size_t __MemAlignForward(size_t p, size_t alignment) {
-    return (p + alignment - 1) & (-alignment);
-}
-
-static void __MemZero(void* p, size_t n) {
-    memset(p, 0, n);
-}
-
-typedef struct {
-    u64 reserved;
-    u64 committed;
-    u64 used;
-    void* base;
-} Arena;
-
-#define ARENA_DEFAULT_RESERVE MegaBytes(64)
-#define ARENA_COMMIT_GRANULARITY KiloBytes(64)
+typedef struct Arena Arena;
 
 #define ArenaPush(arena, type) (_ArenaPush((arena), sizeof(type), ALIGN_OF(type), false))
 #define ArenaPushZeroed(arena, type) (_ArenaPush((arena), sizeof(type), ALIGN_OF(type), true))
 #define ArenaPushArray(arena, type, n) (_ArenaPush((arena), sizeof(type) * (n), ALIGN_OF(type), false))
 #define ArenaPushArrayZeroed(arena, type, n) (_ArenaPush((arena), sizeof(type) * (n), ALIGN_OF(type), true))
 
-void* _ArenaPush(Arena* a, u64 size, u64 alignment, b32 clearToZero) {
-    if (!a->base) {
-        a->base = __VMReserve(ARENA_DEFAULT_RESERVE);
-        a->reserved = ARENA_DEFAULT_RESERVE;
-        if (!a->base) return NULL;
-    }
-    u64 offset = __MemAlignForward(a->used, alignment);
-    u64 end = offset + size;
-    if (end > a->reserved) {
-        return NULL; // TODO: maybe make this crash somehow platform agnostic...
-    }
-    if (end > a->committed) {
-        u64 required = end - a->committed;
-        u64 commit_size = Max(required, ARENA_COMMIT_GRANULARITY);
-        commit_size = __MemAlignForward(commit_size, PAGE_SIZE);
-        if (!__VMCommit((u8*)a->base + a->committed, commit_size)) {
-            return NULL; // TODO: crash
-        }
-        a->committed += commit_size;
-    }
-    a->used = offset + size;
-    if (clearToZero) __MemZero((u8*)a->base + offset, size);
-    return a->base + offset;
+Arena* ArenaInit(u64 appMemory);
+void* _ArenaPush(struct Arena* a, u64 size, u64 alignment, b32 clearToZero);
+Arena* ArenaPushArena(Arena* arena, u64 size);
+void ArenaReset(struct Arena* a, b32 decommit);
+Arena* ArenaScratchInit(u64 size);
+Arena* ArenaScratch(void);
+
+// -------------- Data Structures ------------
+
+typedef struct {
+    void* data;
+    u32 count;
+    u32 capacity;
+} List;
+
+void ListAdd(List* l, u32 size, u32 alignment, ) {
+
 }
 
-void ArenaReset(Arena* a) {
-    a->used = 0;
-}
-
-void ArenaDecommit(Arena* a) {
-    if (a->base) {
-        __VMDecommit(a->base, a->committed);
-    }
-    a->used = a->committed = 0;
-}
-
-// ----------- Strings ------------
+// ------------- String ------------
 
 typedef struct {
     u32 size; // in bytes
@@ -139,17 +84,53 @@ typedef struct {
     u64 capacity;
 } StrBuilder;
 
-#define S(s) (__StrMake(sizeof(s) - 1, s))
+#define S(s) (FromCStr(s))
 
-String __StrMake(u32 size, const char* chars) { 
-    String s;
-    s.size = size;
-    s.ptr = chars;
-    return s;
-}
+String FromCStr(const char * c_str);
+
+char* StrToCStr(Arena* a, String s);
+String StrSlice(String s, u32 start, u32 end);
+
+typedef enum {
+    STRFIND_FLAG_NONE,
+    STRFIND_FLAG_SEARCH_BACKARDS
+} STRFIND_FLAGS;
+
+b32 StrFind(String s, char c, STRFIND_FLAGS flags, u32* index);
+b32 StrEqualsCStr(String s, const char* c);
+b32 CStrEqualsStr(const char* c, String s);
+b32 StrEquals(String s1, String s2);
+
+void StrBuildStr(Arena* arena, StrBuilder* builder, String s);
+void StrBuildCStr(Arena* arena, StrBuilder* builder, const char* c_str);
+void StrBuildChar(Arena* arena, StrBuilder* builder, char c);
+#define StrBuildF(arena, build, format, ...) (StrBuildFormat(arena, build, format, ## __VA_ARGS__))
+void StrBuildFormat(Arena* arena, StrBuilder* builder, const char* format, ...);
+
+// ---------------- Socket ----------------
+
+//typedef struct Socket Socket;
+//typedef struct Message Message; // defined by user, once message for all communication. Use tagged union
+
+//Socket* ArenaPushSocket(Arena* arena);
+//b32 SocketSendMessage(Message* msg);
+//b32 SocketRecvMessage(Message* msg);
+
+// impl
+
+#ifdef CLIB_BASE_IMPLEMENTATION
+#undef CLIB_BASE_IMPLEMENTATION
+#include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
+
+// ----------- Strings ------------
 
 String FromCStr(const char * c_str) {
-    return __StrMake(strlen(c_str), c_str);
+    String s;
+    s.ptr = c_str;
+    s.size = strlen(c_str);
+    return s;
 }
 
 char* StrToCStr(Arena* a, String s) {
@@ -164,11 +145,6 @@ String StrSlice(String s, u32 start, u32 end) {
     out.ptr = s.ptr + start;
     return out;
 }
-
-typedef enum {
-    STRFIND_FLAG_NONE,
-    STRFIND_FLAG_SEARCH_BACKARDS
-} STRFIND_FLAGS;
 
 b32 StrFind(String s, char c, STRFIND_FLAGS flags, u32* index) {
     b32 forwards = !FlagExists(flags, STRFIND_FLAG_SEARCH_BACKARDS);
@@ -189,7 +165,7 @@ b32 CStrEqualsStr(const char* c, String s) {
     return memcmp(c, s.ptr, s.size) == 0;
 }
 b32 StrEquals(String s1, String s2) {
-    return memcmp(s1.ptr, s2.ptr, s1.size) == 0;
+    return s1.size == s2.size && memcmp(s1.ptr, s2.ptr, s1.size) == 0;
 }
 
 #define STR_BUILDER_DEFAULT_CAPACITY (128ull)
@@ -229,7 +205,7 @@ void StrBuildChar(Arena* arena, StrBuilder* builder, char c) {
 
 #define StrBuildF(arena, build, format, ...) (StrBuildFormat(arena, build, format, ## __VA_ARGS__))
 
-void StrBuildF(Arena* arena, StrBuilder* builder, const char* format, ...) {
+void StrBuildFormat(Arena* arena, StrBuilder* builder, const char* format, ...) {
     va_list ap;
     va_start(ap, format);
     va_list ap2;
@@ -244,3 +220,7 @@ void StrBuildF(Arena* arena, StrBuilder* builder, const char* format, ...) {
     }
     va_end(ap);
 }
+
+#endif // CLIB_BASE_IMPLEMENTATION
+
+#endif // CLIB_BASE
