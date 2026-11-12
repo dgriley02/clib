@@ -28,8 +28,9 @@ typedef double f64;
 
 #define Max(a, b) ((a) > (b) ? (a) : (b))
 #define Min(a, b) ((a) < (b) ? (a) : (b))
+#define Clamp(x, a, b) (Min(Max(x, a), b))
 
-#define FlagExists(_enum, i) ((_enum) & (i) == (i))
+#define FlagExists(_enum, i) (((_enum) & (i)) == (i))
 #define FlagSet(_enum, i) ((_enum) |= (i))
 #define FlagClear(_enum, i) ((_enum) &= ~(i))
 #define FlagToggle(_enum, i) ((_enum) ^= (i))
@@ -37,22 +38,13 @@ typedef double f64;
 #define ARR_CONST_LENGTH(A) (sizeof(A) / sizeof(*A))
 
 #define ALIGN_OF(T) (sizeof(struct { u8 a; T b;}))
+#define ALIGN_UP(p, alignment) (((p) + (alignment) - 1) & ~((alignment) - 1))
 
-// -------------- Arena ------------
+struct Arena;
 
-typedef struct Arena Arena;
+// -------------  Errors --------------------
 
-#define ArenaPush(arena, type) (_ArenaPush((arena), sizeof(type), ALIGN_OF(type), false))
-#define ArenaPushZeroed(arena, type) (_ArenaPush((arena), sizeof(type), ALIGN_OF(type), true))
-#define ArenaPushArray(arena, type, n) (_ArenaPush((arena), sizeof(type) * (n), ALIGN_OF(type), false))
-#define ArenaPushArrayZeroed(arena, type, n) (_ArenaPush((arena), sizeof(type) * (n), ALIGN_OF(type), true))
-
-Arena* ArenaInit(u64 appMemory);
-void* _ArenaPush(struct Arena* a, u64 size, u64 alignment, b32 clearToZero);
-Arena* ArenaPushArena(Arena* arena, u64 size);
-void ArenaReset(struct Arena* a, b32 decommit);
-Arena* ArenaScratchInit(u64 size);
-Arena* ArenaScratch(void);
+void LogError(const char* fmt, ...);
 
 // -------------- Data Structures ------------
 
@@ -62,13 +54,30 @@ typedef struct {
     u32 capacity;
 } List;
 
-void ListAdd(List* l, u32 size, u32 alignment, ) {
+#define LIST_DEFAULT_SIZE 64
 
-}
+#define ListAdd(type, arena, list, value) \
+    do { \
+    _ListEnsureLargeEnough(arena, list, sizeof(type), ALIGN_OF(type)); \
+    *((type*)((list)->data) + ((list)->count++)) = value; \
+    } while(0)
+
+#define ListGet(type, list, index) \
+    ((list)->count > 0 ? *((type*)((list)->data) + index) : 0)
+
+#define ListRemove(type, list, index) \
+    if ((list)->count > 0) \
+        *((type*)((list)->data) + index) = *((type*)((list)->data) + (list)->count--)
+
+#define ListClear(list) \
+    (list)->count = 0
+
+void _ListEnsureLargeEnough(struct Arena* arena, List* list, u32 size, u32 alignment);
 
 // ------------- String ------------
 
-typedef struct {
+typedef struct 
+{
     u32 size; // in bytes
     const char* ptr;
 } String;
@@ -88,7 +97,7 @@ typedef struct {
 
 String FromCStr(const char * c_str);
 
-char* StrToCStr(Arena* a, String s);
+char* StrToCStr(struct Arena* a, String s);
 String StrSlice(String s, u32 start, u32 end);
 
 typedef enum {
@@ -101,28 +110,34 @@ b32 StrEqualsCStr(String s, const char* c);
 b32 CStrEqualsStr(const char* c, String s);
 b32 StrEquals(String s1, String s2);
 
-void StrBuildStr(Arena* arena, StrBuilder* builder, String s);
-void StrBuildCStr(Arena* arena, StrBuilder* builder, const char* c_str);
-void StrBuildChar(Arena* arena, StrBuilder* builder, char c);
+void StrCopy(struct Arena* arena, String from, String* into);
+void StrBuildStr(struct Arena* arena, StrBuilder* builder, String s);
+void StrBuildCStr(struct Arena* arena, StrBuilder* builder, const char* c_str);
+void StrBuildChar(struct Arena* arena, StrBuilder* builder, char c);
 #define StrBuildF(arena, build, format, ...) (StrBuildFormat(arena, build, format, ## __VA_ARGS__))
-void StrBuildFormat(Arena* arena, StrBuilder* builder, const char* format, ...);
-
-// ---------------- Socket ----------------
-
-//typedef struct Socket Socket;
-//typedef struct Message Message; // defined by user, once message for all communication. Use tagged union
-
-//Socket* ArenaPushSocket(Arena* arena);
-//b32 SocketSendMessage(Message* msg);
-//b32 SocketRecvMessage(Message* msg);
+void StrBuildFormat(struct Arena* arena, StrBuilder* builder, const char* format, ...);
 
 // impl
 
-#ifdef CLIB_BASE_IMPLEMENTATION
-#undef CLIB_BASE_IMPLEMENTATION
+#ifdef CLIB_BASE_IMPL
+#undef CLIB_BASE_IMPL
+#include <platform.h>
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+
+void _ListEnsureLargeEnough(struct Arena* arena, List* list, u32 size, u32 alignment) {
+    if (!list->data) {
+        if (list->capacity == 0) list->capacity = LIST_DEFAULT_SIZE;
+        list->data = _ArenaPush(arena, size * list->capacity, alignment, false);
+    }
+    if (list->count == list->capacity) {
+        list->capacity *= 2;
+        void* new_data = _ArenaPush(arena, size * list->capacity, alignment, false);
+        MemCopy(new_data, list->data, list->count * sizeof(size));
+        list->data = new_data;
+    }
+}
 
 // ----------- Strings ------------
 
@@ -133,8 +148,9 @@ String FromCStr(const char * c_str) {
     return s;
 }
 
-char* StrToCStr(Arena* a, String s) {
+char* StrToCStr(struct Arena* a, String s) {
     char* out = ArenaPushArray(a, char, s.size + 1);
+    MemCopy(out, (char*)s.ptr, s.size);
     out[s.size] = '\0';
     return out;
 }
@@ -170,7 +186,7 @@ b32 StrEquals(String s1, String s2) {
 
 #define STR_BUILDER_DEFAULT_CAPACITY (128ull)
 
-static void __StrBuilderEnsureLargeEnough(Arena* arena, StrBuilder* builder, u64 required) {
+static void __StrBuilderEnsureLargeEnough(struct Arena* arena, StrBuilder* builder, u64 required) {
     if (builder->capacity <= 0) {
         builder->capacity = STR_BUILDER_DEFAULT_CAPACITY;
     }
@@ -187,17 +203,22 @@ static void __StrBuilderEnsureLargeEnough(Arena* arena, StrBuilder* builder, u64
     }
 }
 
-void StrBuildStr(Arena* arena, StrBuilder* builder, String s) {
+void StrCopy(struct Arena* arena, String from, String* to) {
+    to->size = from.size;
+    to->ptr = ArenaPushArray(arena, char, from.size);
+}
+
+void StrBuildStr(struct Arena* arena, StrBuilder* builder, String s) {
     __StrBuilderEnsureLargeEnough(arena, builder, s.size);
     memcpy(builder->buffer + builder->used, s.ptr, s.size);
     builder->used += s.size;
 }
 
-void StrBuildCStr(Arena* arena, StrBuilder* builder, const char* c_str) {
+void StrBuildCStr(struct Arena* arena, StrBuilder* builder, const char* c_str) {
     StrBuildStr(arena, builder, FromCStr(c_str));
 }
 
-void StrBuildChar(Arena* arena, StrBuilder* builder, char c) {
+void StrBuildChar(struct Arena* arena, StrBuilder* builder, char c) {
     __StrBuilderEnsureLargeEnough(arena, builder, 1);
     *(builder->buffer + builder->used) = c;
     builder->used++;
@@ -205,7 +226,7 @@ void StrBuildChar(Arena* arena, StrBuilder* builder, char c) {
 
 #define StrBuildF(arena, build, format, ...) (StrBuildFormat(arena, build, format, ## __VA_ARGS__))
 
-void StrBuildFormat(Arena* arena, StrBuilder* builder, const char* format, ...) {
+void StrBuildFormat(struct Arena* arena, StrBuilder* builder, const char* format, ...) {
     va_list ap;
     va_start(ap, format);
     va_list ap2;
