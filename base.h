@@ -294,6 +294,17 @@ struct MapEntry { u64 hash, index; };
 #include <stdarg.h>
 #include <stdio.h>
 
+#define LogErrorsToStderr \
+void LogError(const char* fmt, ...) { \
+    va_list args; \
+    va_start(args, fmt); \
+    vfprintf(stderr, fmt, args); \
+    va_end(args); \
+    fputc('\n', stderr); \
+    fflush(stderr); \
+}
+ 
+
 // ----------- Strings ------------
 
 String FromCStr(const char * c_str) {
