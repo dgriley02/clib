@@ -92,6 +92,18 @@ void StrBuildReset(StrBuilder* builder);
 
 // -------------- Data Structures ------------
 
+struct BitSet {
+    u64 n_blocks;
+    u64* blocks;
+};
+
+struct BitSet ArenaPushBitSet(struct Arena* arena, u64 n);
+
+#define BitSet(b, i) ((b).blocks[(i) >> 9] |= (1ul << (i)))
+#define BitUnset(b, i) ((b).blocks[(i) >> 9] &= ~(1ul << (i)))
+#define BitToggle(b, i) ((b).blocks[(i) >> 9] ^= (1ul << (i)))
+#define BitIsSet(b, i) (((b).blocks[(i) >> 9] & (1ul << (i))) != 0)
+
 #define List(T) CAT(List_, T)
 #define ListDef(T) \
     typedef struct List(T) { \
@@ -407,6 +419,17 @@ void StrBuildFormat(struct Arena* arena, StrBuilder* builder, const char* format
 u64 StrBuildMark(StrBuilder* builder) { return builder->used; }
 void StrBuildResetTo(StrBuilder* builder, u64 to) { builder->used = to; }
 void StrBuildReset(StrBuilder* builder) { builder->used = 0; }
+
+// Data structures
+
+struct BitSet ArenaPushBitSet(struct Arena* arena, u64 n) {
+    n = (n >> 9) + (n & 63lu) != 0;
+    return (struct BitSet) {
+        .n_blocks = n,
+        .blocks = ArenaPushArrayZeroed(arena, u64, n)
+    };
+}
+
 
 #endif // CLIB_BASE_IMPLEMENTATION
 
