@@ -163,10 +163,11 @@ b32 GpuArenaInit(struct GpuArena* arena, VkMemoryPropertyFlags props, u64 size) 
     return true;
 }
 
-
 void GpuArenaReset(struct GpuArena* arena) {
     arena->used = 0;
 }
+
+VkResult GpuAllocUBO(struct GpuArena* 
 
 VkResult GpuAlloc(struct GpuArena* arena, VkMemoryRequirements* requirements, struct GpuAlloc* out_alloc) {
     if ((requirements->memoryTypeBits & (1u << arena->memory_type_index)) == 0) return VK_ERROR_NOT_PERMITTED; // this means our assertion failed

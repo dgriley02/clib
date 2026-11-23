@@ -4,6 +4,7 @@
 void MemCopy(void* dst, void* src, size_t n);
 i32  MemCmp(void* a, void* b, size_t n);
 void MemZero(void* p, size_t n);
+void MemFF(void* p, size_t n);
 
 struct Arena;
 void* _ArenaPush(struct Arena* a, u64 size, u64 alignment, b32 clearToZero);
@@ -16,10 +17,10 @@ struct Arena* ArenaInit(u64 appMemory);
 struct Arena* ArenaScratch();
 struct Arena* ArenaScratchInit(u64 size);
 
-#define ArenaPush(arena, type) (_ArenaPush((arena), sizeof(type), ALIGN_OF(type), false))
-#define ArenaPushZeroed(arena, type) (_ArenaPush((arena), sizeof(type), ALIGN_OF(type), true))
-#define ArenaPushArray(arena, type, n) (_ArenaPush((arena), sizeof(type) * (n), ALIGN_OF(type), false))
-#define ArenaPushArrayZeroed(arena, type, n) (_ArenaPush((arena), sizeof(type) * (n), ALIGN_OF(type), true))
+#define ArenaPush(arena, type) (_ArenaPush((arena), sizeof(type), alignof(type), false))
+#define ArenaPushZeroed(arena, type) (_ArenaPush((arena), sizeof(type), alignof(type), true))
+#define ArenaPushArray(arena, type, n) (_ArenaPush((arena), sizeof(type) * (n), alignof(type), false))
+#define ArenaPushArrayZeroed(arena, type, n) (_ArenaPush((arena), sizeof(type) * (n), alignof(type), true))
 
 struct File;
 enum FileOpenMode { 
@@ -31,6 +32,8 @@ b32 FileRead(struct Arena* arena, struct File* file, u8** out_data, u64* out_n);
 b32 FileWrite(struct File* file, u8* data, int n);
 b32 FileClose(struct File* file);
 
+b32 DirectoryCreate(String path);
+b32 DirectoryEnumFiles(struct Arena* arena, String path, String** out_entries, u64* out_n_entries);
 #ifdef CLIB_PLATFORM_IMPL
 
 #ifdef __linux__
@@ -44,6 +47,7 @@ b32 FileClose(struct File* file);
 void MemCopy(void* dst, void* src, size_t n) { memcpy(dst, src, n); }
 i32  MemCmp(void* a, void* b, size_t n) { return (i32)memcmp(a, b, n); }
 void MemZero(void* p, size_t n) { memset(p, 0, n); }
+void MemFF(void* p, size_t n) { memset(p, 0xFF, n); }
 
 static u32 __GetPageSize(void) {
     static u32 cached_page_size = 0;
@@ -146,7 +150,7 @@ b32 FileOpen(struct Arena* arena, String path, enum FileOpenMode mode, struct Fi
     }
     ArenaResetTo(arena, mark);
     out_file->fd = fd;
-    StrCopy(arena, path, &out_file->name);
+    out_file->name = StrCopy(arena, path);
     return true;
 }
 
@@ -183,6 +187,45 @@ b32 FileClose(struct File* file) {
     }
     return true;
 }
+
+// Directory
+
+#include <dirent.h>
+
+struct Directory { String name; };
+
+b32 DirectoryCreate(String path) {
+    int res = mkdir(path.ptr, 0777);
+    if (res < 0) {
+        LogError("Error creating directory %s: %s (errno: %d)", path.ptr, strerror(errno), errno);
+        return false;
+    }
+    return true;
+}
+
+b32 DirectoryEnumFiles(struct Arena* arena, String path, String** out_names, u64* out_n_entries) {
+    DIR* dp = opendir(path.ptr);
+    if (!dp) {
+        LogError("Error opening directory %s: %s (errno: %d)", path.ptr, strerror(errno), errno);
+        return false;
+    }
+
+    u64 count = 0;
+    struct dirent* entry;
+
+    List(String) names = {0};
+    while ((entry = readdir(dp)) != NULL && count < 1000) {
+        String name = S(entry->d_name);
+        if (Eq(name, S(".")) || Eq(name, S(".."))) continue;
+        ListAdd(arena, names, StrCopy(arena, name)); // closedir will free the string
+    }
+    closedir(dp);
+
+    *out_names = names.data;
+    *out_n_entries = names.count;
+    return true;
+}
+
 
 #elif TODO_PLATFORM_WINDOWS
 

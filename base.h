@@ -37,8 +37,13 @@ typedef double f64;
 
 #define ARR_CONST_LENGTH(A) (sizeof(A) / sizeof(*A))
 
-#define ALIGN_OF(T) (sizeof(struct { u8 a; T b;}))
 #define ALIGN_UP(p, alignment) (((p) + (alignment) - 1) & ~((alignment) - 1))
+
+// indirection for nested macros with pasting
+#define CAT_(a, b) a##b
+#define CAT(a, b) CAT_(a, b)
+
+#define overload __attribute__((overloadable))
 
 struct Arena;
 
@@ -46,46 +51,18 @@ struct Arena;
 
 void LogError(const char* fmt, ...);
 
-// -------------- Data Structures ------------
-
-typedef struct {
-    void* data;
-    u32 count;
-    u32 capacity;
-} List;
-
-#define LIST_DEFAULT_SIZE 64
-
-#define ListAdd(type, arena, list, value) \
-    do { \
-    _ListEnsureLargeEnough(arena, list, sizeof(type), ALIGN_OF(type)); \
-    *((type*)((list)->data) + ((list)->count++)) = value; \
-    } while(0)
-
-#define ListGet(type, list, index) \
-    ((list)->count > 0 ? *((type*)((list)->data) + index) : 0)
-
-#define ListRemove(type, list, index) \
-    if ((list)->count > 0) \
-        *((type*)((list)->data) + index) = *((type*)((list)->data) + (list)->count--)
-
-#define ListClear(list) \
-    (list)->count = 0
-
-void _ListEnsureLargeEnough(struct Arena* arena, List* list, u32 size, u32 alignment);
-
 // ------------- String ------------
 
 typedef struct 
 {
-    u32 size; // in bytes
+    u64 size; // in bytes
     const char* ptr;
 } String;
 
 typedef struct {
     union {
         struct {
-            u32 used;
+            u64 used;
             char* buffer;
         };
         String value;
@@ -100,22 +77,201 @@ String FromCStr(const char * c_str);
 char* StrToCStr(struct Arena* a, String s);
 String StrSlice(String s, u32 start, u32 end);
 
-typedef enum {
-    STRFIND_FLAG_NONE,
-    STRFIND_FLAG_SEARCH_BACKARDS
-} STRFIND_FLAGS;
+b32 StrFind(String s, char c, u64* index);
+u32 StrSplit(struct Arena* arena, String s, char c, String** split);
 
-b32 StrFind(String s, char c, STRFIND_FLAGS flags, u32* index);
-b32 StrEqualsCStr(String s, const char* c);
-b32 CStrEqualsStr(const char* c, String s);
-b32 StrEquals(String s1, String s2);
-
-void StrCopy(struct Arena* arena, String from, String* into);
+String StrCopy(struct Arena* arena, String from);
 void StrBuildStr(struct Arena* arena, StrBuilder* builder, String s);
 void StrBuildCStr(struct Arena* arena, StrBuilder* builder, const char* c_str);
 void StrBuildChar(struct Arena* arena, StrBuilder* builder, char c);
 #define StrBuildF(arena, build, format, ...) (StrBuildFormat(arena, build, format, ## __VA_ARGS__))
 void StrBuildFormat(struct Arena* arena, StrBuilder* builder, const char* format, ...);
+u64 StrBuildMark(StrBuilder* builder);
+void StrBuildResetTo(StrBuilder* builder, u64 to);
+void StrBuildReset(StrBuilder* builder);
+
+// -------------- Data Structures ------------
+
+#define List(T) CAT(List_, T)
+#define ListDef(T) \
+    typedef struct List(T) { \
+        u64 count, capacity; \
+        T *data; \
+    } List(T)
+
+ListDef(i32); ListDef(i64); ListDef(u32); ListDef(u64); ListDef(String);
+
+#define LIST_DEFAULT_SIZE 64
+
+#define ListAdd(arena, list, value) \
+    do { \
+        if (!(list).data) { \
+            if ((list).capacity == 0) (list).capacity = LIST_DEFAULT_SIZE; \
+            (list).data = ArenaPushArray(arena, typeof(*(list).data), (list).capacity); \
+        } \
+        if ((list).count == (list).capacity) { \
+            (list).capacity *= 2; \
+            void* new_data = ArenaPushArray(arena, typeof(value), (list).capacity); \
+            MemCopy(new_data, (list).data, (list).count * sizeof(value)); \
+            (list).data = new_data; \
+        } \
+        (list).data[(list).count++] = (value); \
+    } while(0)
+
+#define ListGet(list, index) \
+    ((list).count > 0 ? (list).data + (index) : 0)
+
+#define ListRemove( list, index) \
+    do { \
+        if ((list).count > 0) \
+            ((list).data[index] = (list).data[--(list).count]) \
+    } while(0)
+
+#define ListClear(list) \
+    (list).count = 0
+
+// Hashmap
+
+// TODO:
+overload u64 Hash(u64 x) { return x*31; }
+overload u64 Hash(String str) { return 0;}
+
+overload u64 Eq(u64 a, u64 b) { return a == b; }
+overload b32 Eq(String a, String b) { 
+    if (a.size != b.size) return false;
+    for (u64 i = 0; i < a.size; ++i) if (a.ptr[i] != b.ptr[i]) return false;
+    return true;
+}
+
+b32 EqScalar(u64 a, u64 b) { return a == b; }
+b32 HashScalar(u64 x) { return x * 31; }
+
+struct MapEntry { u64 hash, index; };
+#define Map(K, V) CAT(CAT(Map_, K), CAT(_, V))
+#define MapDef(K, V) \
+    typedef struct Map(K, V) { \
+        u64 count, capacity; \
+        struct MapEntry* table; \
+        struct { K key; V value; }* kvps; \
+    } Map(K, V)
+
+#define HM_EMPTY ~0ll
+#define Fix(h_) ((h_) == HM_EMPTY ? 1ll : (h_))
+
+#define MapPut(arena, map, k_, v_) \
+    do { \
+        if (!(map).table) { \
+            if (!(map).capacity) (map).capacity = 1024; \
+            (map).count = 0; \
+            (map).table = ArenaPushArray(arena, struct MapEntry, (map).capacity); \
+            MemFF((map).table, sizeof(struct MapEntry) * (map).capacity); \
+            (map).kvps = _ArenaPush(arena, sizeof(*(map).kvps) * (map).capacity, __alignof__(*(map).kvps), false); \
+        } \
+        u64 hash__ = Hash(k_); hash__ = Fix(hash__); \
+        u64 i__ = hash__ & ((map).capacity - 1); \
+        for (u64 j__ = 0; j__ < (map).capacity; ++j__) { \
+            if ((map).table[i__].hash == HM_EMPTY) { \
+                if ((map).count >= (map).capacity * 3 / 4) { LogError("Hashmap full!"); break; } \
+                (map).kvps[(map).count].key = (k_); \
+                (map).kvps[(map).count].value = (v_); \
+                (map).table[i__].hash = hash__; \
+                (map).table[i__].index = (map).count; \
+                (map).count++; \
+                break; \
+            } else if((map).table[i__].hash == hash__ && Eq((k_), (map).kvps[((map).table[i__].index)].key)) { \
+                (map).kvps[(map).table[i__].index].value = (v_); \
+                break; \
+            } \
+            i__ = (i__ + 1) & ((map).capacity - 1); \
+        } \
+    } while(0)
+
+#define MapGet(map, k_) ({ \
+        u64 r__ = ~0ll; \
+        if ((map).table != 0) { \
+        u64 hash__ = Hash(k_); hash__ = Fix(hash__); \
+        u64 i__ = hash__ & ((map).capacity - 1); \
+        for (u64 j__ = 0; j__ < (map).capacity; ++j__) { \
+        struct MapEntry* e__ = (map).table + i__; \
+        if (e__->hash == HM_EMPTY) break; \
+        if(Eq((k_), (map).kvps[e__->index].key)) { \
+        r__ = (e__->index); \
+        break; \
+        } \
+        i__ = (i__ + 1) & ((map).capacity - 1); \
+        } \
+        } \
+        r__ == ~0ll ? 0 : &(map).kvps[r__].value; })
+
+#define MapGetOrPut(map, k_, v_) ({ \
+        u64 r__ = ~0ll; \
+        if (!(map).table) { \
+        if (!(map).capacity) (map).capacity = 1024; \
+        (map).count = 0; \
+        (map).table = ArenaPushArray(arena, struct MapEntry, (map).capacity); \
+        MemFF((map).table, sizeof(struct MapEntry) * (map).capacity); \
+        (map).kvps = _ArenaPush(arena, sizeof(*(map).kvps) * (map).capacity, __alignof__(*(map).kvps), false); \
+        } \
+        u64 hash__ = Hash(k_); hash__ = Fix(hash__); \
+        u64 i__ = hash__ & ((map).capacity - 1); \
+        for (u64 j__ = 0; j__ < (map).capacity; ++j__) { \
+        struct MapEntry* e__ = (map).table + i__; \
+        if (e__->hash == HM_EMPTY) { \
+        if ((map).count >= (map).capacity * 3 / 4) { LogError("Hashmap full!"); break; } \
+        e__->hash = hash__; \
+        e__->index = (map).count; \
+        (map).kvps[(map).count].key = (k_); \
+        (map).kvps[(map).count].value = (v_); \
+        (map).count++; \
+        r__ = e__->index; \
+            break; \
+        } \
+            if(Eq((k_), (map).kvps[e__->index].key)) { \
+                r__ = e__->index; \
+                break; \
+            } \
+            i__ = (i__ + 1) & ((map).capacity - 1); \
+        } \
+    r__ == ~0ll ? 0 : &(map).kvps[r__].value; })
+
+#define HashmapRemove(map, Tkey, Tvalue, key, hash_func, eq_func) \
+    do { \
+        u64 hash__ = hash_func(key); \
+        u32 i__ = hash__ % (map).capacity; \
+        while ((map).key_hashes[i__] == hash__) { \
+            if (eq_func(((Tkey*)(map).keys)[i__], (key))) {  \
+                u32 j__; \
+                for (j__ = i__ + 1; (map).key_hashes[j__] == hash__; j__ = (j__ + 1) % (map).capacity) {} \
+                j__ -= 1; \
+                (map).key_hashes[j__] = HM_EMPTY; \
+                if (j__ != i__) { \
+                    ((Tkey*)(map).keys)[i__] = ((Tvalue*)(map).keys)[j__]; \
+                    ((Tvalue*)(map).values)[i__] = ((Tvalue*)(map).values)[j__]; \
+                } \
+            } \
+            i__ = (i__ + 1) % (map).capacity; \
+        } \
+    } while(0)
+
+#define HashmapAdd(map, Tkey, Tvalue, key, value, hash_func, eq_func) \
+    do { \
+        u64 hash__ = hash_func(key); \
+        u32 i__ = hash__ % (map).capacity; \
+        while ((map).key_hashes[i__] == hash__) { \
+            if (eq_func(((Tkey*)(map).keys)[i__], (key))) {  \
+                (map).key_hashes[i__] = HM_EMPTY; \
+                break; \
+            } \
+            i__ = (i__ + 1) % (map).capacity; \
+        } \
+        if ((map).key_hashes[i__] == HM_EMPTY) { \
+            (map).key_hashes[i__] = hash__; \
+            ((Tkey*)(map).keys)[i__] = key; \
+            ((Tvalue*)(map).values)[i__] = value; \
+        } else LogError("Hashmap full"); \
+    } while(0)
+
+#define Hashmap 
 
 // impl
 
@@ -125,19 +281,6 @@ void StrBuildFormat(struct Arena* arena, StrBuilder* builder, const char* format
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
-
-void _ListEnsureLargeEnough(struct Arena* arena, List* list, u32 size, u32 alignment) {
-    if (!list->data) {
-        if (list->capacity == 0) list->capacity = LIST_DEFAULT_SIZE;
-        list->data = _ArenaPush(arena, size * list->capacity, alignment, false);
-    }
-    if (list->count == list->capacity) {
-        list->capacity *= 2;
-        void* new_data = _ArenaPush(arena, size * list->capacity, alignment, false);
-        MemCopy(new_data, list->data, list->count * sizeof(size));
-        list->data = new_data;
-    }
-}
 
 // ----------- Strings ------------
 
@@ -162,26 +305,9 @@ String StrSlice(String s, u32 start, u32 end) {
     return out;
 }
 
-b32 StrFind(String s, char c, STRFIND_FLAGS flags, u32* index) {
-    b32 forwards = !FlagExists(flags, STRFIND_FLAG_SEARCH_BACKARDS);
-    u32 start = forwards ? 0 : s.size - 1;
-    u32 end = forwards ? s.size : 0; 
-    u32 i = start;
-    while (i != end) {
-        if (s.ptr[i] == c) { *index = i; return true;}
-        i = forwards ? i + 1 : i - 1;
-    }
+b32 StrFind(String s, char c, u64* index) {
+    for (u64 i = 0; i < s.size; ++i) if (s.ptr[i] == c) { *index = i; return true; }
     return false;
-}
-
-b32 StrEqualsCStr(String s, const char* c) {
-    return memcmp(s.ptr, c, s.size) == 0;
-}
-b32 CStrEqualsStr(const char* c, String s) {
-    return memcmp(c, s.ptr, s.size) == 0;
-}
-b32 StrEquals(String s1, String s2) {
-    return s1.size == s2.size && memcmp(s1.ptr, s2.ptr, s1.size) == 0;
 }
 
 #define STR_BUILDER_DEFAULT_CAPACITY (128ull)
@@ -203,15 +329,49 @@ static void __StrBuilderEnsureLargeEnough(struct Arena* arena, StrBuilder* build
     }
 }
 
-void StrCopy(struct Arena* arena, String from, String* to) {
-    to->size = from.size;
-    to->ptr = ArenaPushArray(arena, char, from.size);
+u32 StrSplit(struct Arena* arena, String s, char c, String** out_splits) {
+    u32 n_splits = 0;
+    u64 prev_index = 0;
+    String* splits = NULL;
+    for (u64 i = 0; i < s.size; ++i) {
+        if (s.ptr[i] == c) { 
+            u64 n_slice = i - prev_index;
+            if (n_slice > 0) {
+                String* split = ArenaPush(arena, String);
+                if (!splits) splits = split;
+                split->size = i - prev_index;
+                split->ptr = s.ptr + prev_index;
+                n_splits++;
+            }
+            prev_index = i + 1;
+        }
+    }
+    if (prev_index < s.size) {
+        String* split = ArenaPush(arena, String);
+        if (!splits) splits = split;
+        split->size = s.size - prev_index;
+        split->ptr = s.ptr + prev_index;
+        n_splits++;
+    }
+
+    *out_splits = splits;
+    return n_splits;
+}
+
+String StrCopy(struct Arena* arena, String from) {
+    char* p = ArenaPushArray(arena, char, from.size);
+    MemCopy(p, (void*)from.ptr, from.size);
+    return (String) {
+        .ptr = p,
+        .size = from.size
+    };
 }
 
 void StrBuildStr(struct Arena* arena, StrBuilder* builder, String s) {
-    __StrBuilderEnsureLargeEnough(arena, builder, s.size);
+    __StrBuilderEnsureLargeEnough(arena, builder, s.size + 1);
     memcpy(builder->buffer + builder->used, s.ptr, s.size);
     builder->used += s.size;
+    builder->buffer[builder->used] = '\0'; // in case we need it
 }
 
 void StrBuildCStr(struct Arena* arena, StrBuilder* builder, const char* c_str) {
@@ -219,9 +379,10 @@ void StrBuildCStr(struct Arena* arena, StrBuilder* builder, const char* c_str) {
 }
 
 void StrBuildChar(struct Arena* arena, StrBuilder* builder, char c) {
-    __StrBuilderEnsureLargeEnough(arena, builder, 1);
+    __StrBuilderEnsureLargeEnough(arena, builder, 2);
     *(builder->buffer + builder->used) = c;
     builder->used++;
+    builder->buffer[builder->used] = '\0'; // in case we need it
 }
 
 #define StrBuildF(arena, build, format, ...) (StrBuildFormat(arena, build, format, ## __VA_ARGS__))
@@ -235,12 +396,17 @@ void StrBuildFormat(struct Arena* arena, StrBuilder* builder, const char* format
     va_end(ap2);
 
     if (required >= 0) {
-        __StrBuilderEnsureLargeEnough(arena, builder, (u64)required);
+        __StrBuilderEnsureLargeEnough(arena, builder, (u64)required + 1);
         vsnprintf(builder->buffer + builder->used, builder->capacity - builder->used, format, ap);
         builder->used += (u64)required;
+        builder->buffer[builder->used] = '\0'; // in case we need it
     }
     va_end(ap);
 }
+
+u64 StrBuildMark(StrBuilder* builder) { return builder->used; }
+void StrBuildResetTo(StrBuilder* builder, u64 to) { builder->used = to; }
+void StrBuildReset(StrBuilder* builder) { builder->used = 0; }
 
 #endif // CLIB_BASE_IMPLEMENTATION
 
